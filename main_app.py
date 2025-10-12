@@ -23,6 +23,7 @@ import pyqtgraph as pg
 from pulse_monitor_interface import PulseDiagnosisInterface, DeviceStatus, SensorDataPoint
 from fake_pulse_monitor import FakePulseMonitor
 from real_pulse_monitor import RealPulseMonitor
+from analysis_sender import push_analysis_from_text
 from similarity_predictor import load_specific_database, find_most_similar, extract_features
 from rag_example import RAGApplication
 
@@ -267,7 +268,7 @@ class PulseMonitorGUI(QMainWindow):
                 "你是一位專業的中醫師。請嚴格依下列『制式化輸出合約』與『標準輸出模板』作答，只根據提供的病人與脈象資訊，不得加入任何多餘說明或提問。\n【制式化輸出合約】\n- 僅輸出模板內容；禁止額外對話/開場白/結語/解說。\n- 標題與順序必須完全一致，包含首行 。\n- 劑量欄位僅填數字（可含一位小數），不得附加 g 或括號備註；準備/先煎等寫在「煎服方法」。\n- 若暫不開藥：表格僅保留表頭；「煎服方法：不需煎服」；休息/保暖/觀察等寫在「用藥禁忌與注意事項」。\n- 「暫不建議使用中藥」等同義語句全文最多一次，且僅能出現在「用藥禁忌與注意事項」。\n- 僅允許在「用藥禁忌與注意事項」用項目符號（- ），不得用破折/連字號作分隔線。\n- 不得新增/刪減/改動任何標題文字；不得使用除模板外的 ` 或**或 ####。\n- 資訊不足時仍須依現有資料完成判斷，不得向使用者追問。\n\n### 病人資訊\n{patient_context}\n\n### 脈象資訊\n- 位置: {hand}手{position}部 ({pressure_level}脈)\n- 初步比對脈象: **{pulse_name}**\n- 特徵描述: '{feature_description}'\n\n請直接輸出下列『標準輸出模板』，以填入內容的方式給出最終答案：\n####脈象判斷\n[此處填寫您對脈象的判斷]\n\n####證候診斷 (總結)\n[此處填寫您對具體病症的診斷]\n\n####個人化用藥建議 (含劑量)\n| 藥材 | 劑量 (g/日) | 作用 |\n| :--- | :--- | :--- |\n| [藥材1] | [劑量1] | [作用1] |\n| [藥材2] | [劑量2] | [作用2] |\n\n**煎服方法**：[此處填寫煎服方法]\n\n#### 用藥禁忌與注意事項\n- [注意事項1]\n- [注意事項2]\n"
             ).format(patient_context=patient_context, hand='左', position=position, pressure_level=pressure_level, pulse_name=preliminary_pulse_name, feature_description=feature_description)
             full_position_name = f"{position}部 ({pressure_level}脈)"
-            self.current_analysis_results[full_position_name] = {'sim_results': sim_results, 'features_str': feature_description, 'rag_response': '<h4>正在等候 RAG 系統回覆...</h4>'}
+            self.current_analysis_results[full_position_name] = {'sim_results': sim_results, 'features_str': feature_description, 'rag_response': '<h4>正在等候 RAG 系統回覆...</h4>', 'feature_vector': current_features_vec}
             self.start_rag_query.emit(full_position_name, query_text)
 
     @pyqtSlot(str, str)
@@ -277,36 +278,74 @@ class PulseMonitorGUI(QMainWindow):
         if len(self.current_analysis_results) == 3 and all('rag_response' in v and '回覆' not in v['rag_response'] for v in self.current_analysis_results.values()):
             self._update_display_from_results()
 
+    @pyqtSlot()
     def _update_display_from_results(self):
-        html_output = "<html><body>"; display_order = [key for key in sorted(self.current_analysis_results.keys(), key=lambda x: ['寸', '關', '尺'].index(x[0]))]
+        html_output = "<html><body>"
+        display_order = [key for key in sorted(self.current_analysis_results.keys(), key=lambda x: ['寸', '關', '尺'].index(x[0]))]
+
         for pos_key in display_order:
             result = self.current_analysis_results[pos_key]
+            
             sim_results_data = result.get('sim_results')
-            if isinstance(sim_results_data, dict): preliminary_pulse_name = sim_results_data.get('最相似的標準樣本', '比對失敗')
-            else: preliminary_pulse_name = "比對失敗"
+            if isinstance(sim_results_data, dict):
+                preliminary_pulse_name = sim_results_data.get('最相似的標準樣本', '比對失敗')
+            else:
+                preliminary_pulse_name = "比對失敗"
+
             html_output += f'<p align="center" style="font-size: 16px;"><b>--- {pos_key} 分析 ---</b></p>'
-            html_output += f"<pre><b>量化特徵:</b> {result['features_str']}\n<b>初步比對:</b> {preliminary_pulse_name}</pre>"
+            
+            # --- 【核心修正開始】 ---
+            # 建立一個新的文字區塊來存放所有量化數據
+            quantitative_block = f"<b>量化特徵:</b> {result['features_str']}\n<b>初步比對:</b> {preliminary_pulse_name}"
+            
+            # 獲取我們在步驟一中儲存的特徵向量
+            feature_vector = result.get('feature_vector')
+            
+            # 檢查特徵向量是否存在且有效
+            if feature_vector is not None and len(feature_vector) >= 7:
+                try:
+                    # 根據 similarity_predictor.py 的定義來解析特徵
+                    # feature_vector = [mean_y, std_y, max_y, min_y, mean_diff, std_diff, num_peaks]
+                    avg_pressure = feature_vector[0]
+                    amplitude = feature_vector[2] - feature_vector[3]
+                    peak_count = feature_vector[6]
+                    
+                    # 從GUI讀取測量時長以計算心率
+                    duration = int(self.duration_input.text())
+                    heart_rate = (peak_count / duration) * 60 if duration > 0 else 0
+                    
+                    # 將計算出的數值加入到文字區塊中
+                    quantitative_block += f"\n心率 (bpm): {heart_rate:.0f}"
+                    quantitative_block += f"\n振幅 (Pa): {amplitude:.1f}"
+                    quantitative_block += f"\n平均壓力 (Pa): {avg_pressure:.1f}"
+
+                except (ValueError, TypeError, IndexError) as e:
+                    print(f"計算量化指標時出錯: {e}")
+
+            # 使用 <pre> 標籤來保留換行格式並顯示
+            html_output += f"<pre>{quantitative_block}</pre>"
+            # --- 【核心修正結束】 ---
+
             rag_html = markdown.markdown(result['rag_response'], extensions=['fenced_code', 'tables'])
             html_output += f"<div>{rag_html}</div><hr>"
-        html_output += "</body></html>"; self.analysis_result_text.setHtml(html_output)
-        self.save_report_button.setEnabled(True); self.log_message_signal.emit("整合分析報告已完成！")
-        self._save_distance_report()
-
-    def _save_distance_report(self):
+            
+        html_output += "</body></html>"
+        self.analysis_result_text.setHtml(html_output)
+        self.save_report_button.setEnabled(True)
+        self.log_message_signal.emit("整合分析報告已完成！")
+        
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S"); filename = f"pulse_distance_report_{timestamp}.txt"
-            report_content = f"脈搏波形相似度比對詳細報告\n時間: {timestamp}\n" + "=" * 40 + "\n\n"
-            display_order = [key for key in sorted(self.current_analysis_results.keys(), key=lambda x: ['寸', '關', '尺'].index(x[0]))]
-            for pos_key in display_order:
-                result = self.current_analysis_results[pos_key]; report_content += f"--- {pos_key} 比對結果 ---\n"
-                sim_data = result.get('sim_results')
-                if isinstance(sim_data, dict):
-                     report_content += f"  - {sim_data.get('最相似的標準樣本', ''):<5s} (距離: {sim_data.get('相似度(距離)', 0)})\n"
-                else: report_content += f"  - 比對失敗或無結果: {sim_data}\n"
-                report_content += "\n"
-            with open(filename, 'w', encoding='utf-8') as f: f.write(report_content)
-            self.log_message_signal.emit(f"詳細距離報告已自動儲存至: {filename}")
-        except Exception as e: self.log_message_signal.emit(f"錯誤：自動儲存距離報告失敗 - {e}")
+            full_text_report = self.analysis_result_text.toPlainText()
+            self.log_message_signal.emit("正在將分析報告傳送到遠端伺服器...")
+            push_analysis_from_text(full_text_report)
+            self.log_message_signal.emit("報告已成功傳送！")
+            
+        except Exception as e:
+            error_msg = f"錯誤：傳送報告到伺服器失敗 - {e}"
+            print(error_msg)
+            self.log_message_signal.emit(error_msg)
+        
+        self._save_distance_report()
 
     def _handle_save_report(self):
         report_text = self.analysis_result_text.toPlainText();

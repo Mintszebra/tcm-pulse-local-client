@@ -29,17 +29,17 @@ def parse_pulse_report(text: str):
         }
 
         # --- Quantitative Features ---
-        hr = re.search(r"心率[:：]\s*([\d.]+)", content)
+        hr = re.search(r"心率\s*\(bpm\)[:：]\s*([\d.]+)", content)
         if hr: data["heart_rate_bpm"] = float(hr.group(1))
 
-        amp = re.search(r"振幅[:：]\s*([\d.]+)", content)
+        amp = re.search(r"振幅\s*\(Pa\)[:：]\s*([\d.]+)", content)
         if amp: data["avg_amplitude_pa"] = float(amp.group(1))
 
-        press = re.search(r"平均壓力[:：]\s*([\d.]+)", content)
+        press = re.search(r"平均壓力\s*\(Pa\)[:：]\s*([\d.]+)", content)
         if press: data["avg_pressure_pa"] = float(press.group(1))
 
         # --- Traditional Pulse Name ---
-        pulse = re.search(r"傳統脈象[:：]\s*(\S+)", content)
+        pulse = re.search(r"初步比對[:：]\s*(\S+)", content)
         if pulse: data["pulse_name"] = pulse.group(1)
 
         # --- Pulse Judgment ---
