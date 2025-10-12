@@ -1,4 +1,4 @@
-# 檔案: pulse_monitor_interface.py (修改後)
+# 檔案: pulse_monitor_interface.py
 # 描述: 定義與「桌上型中醫脈診模擬與數據採集系統」互動的抽象介面 (API Contract)。
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from typing import List, Dict, Callable, Any
 
 # ==============================================================================
 # 1. 資料結構定義 (Data Structures)
-#    (此部分保持不變)
 # ==============================================================================
 
 class DeviceStatus(Enum):
@@ -31,7 +30,6 @@ class SensorDataPoint:
 
 # ==============================================================================
 # 2. 回呼函數型別定義 (Callback Type Definitions)
-#    (此部分保持不變)
 # ==============================================================================
 
 EventCallback = Callable[[Any], None]
@@ -69,7 +67,6 @@ class PulseDiagnosisInterface(ABC):
     def is_connected(self) -> bool:
         pass
         
-    # --- ADDED ---
     @abstractmethod
     def set_pressure_levels_pa(self, cun_pa: float, guan_pa: float, chi_pa: float) -> None:
         """
@@ -83,7 +80,6 @@ class PulseDiagnosisInterface(ABC):
         """
         pass
 
-    # --- MODIFIED ---
     @abstractmethod
     def start_measurement_by_level(self, levels: List[PulseDiagnosisInterface.PressureLevel], duration_s: float = 20.0) -> None:
         """
@@ -94,21 +90,18 @@ class PulseDiagnosisInterface(ABC):
         """
         pass
     
-    # --- MODIFIED ---
+    @abstractmethod
     def start_measurement_by_profile(self, profile: MeasurementProfile, duration_s: float = 20.0):
         """
         【高階API】以預設的測量模式開始一次固定時長的測量。
         :param duration_s: 測量持續時間（秒）。
         """
-        # 注意：此高階 API 的具體壓力對應，將由實現它的類別來定義
-        # 例如 RealPulseMonitor 中會將 PressureLevel 映射到具體的 Pa 值
         pass
 
     @abstractmethod
     def stop_measurement(self) -> None:
         pass
 
-    # --- ADDED ---
     @abstractmethod
     def reset(self) -> None:
         """

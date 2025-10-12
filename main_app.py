@@ -1,351 +1,373 @@
-# 檔案: main_app.py (版本 3.4 - 修正遺漏函式並確保完整)
-import sys, csv
-from collections import deque
-from typing import Optional, Dict, List, Any
-from scipy.signal import find_peaks, butter, filtfilt
-from dataclasses import fields
+# 檔案: main_app.py
+# 描述: 最終修正版，恢復了手動設定測量壓力層級的功能，並修復了UI邏輯錯誤。
+
+import sys
+import csv
+import pandas as pd
+import numpy as np
 import markdown
+from collections import deque
+from typing import Optional, List, Any
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QGroupBox, QComboBox, QListWidget, QTextEdit, QMessageBox,
-    QFileDialog, QRadioButton, QDialog, QLabel, QDialogButtonBox, QLineEdit,
-    QCheckBox, QFormLayout
+    QPushButton, QGroupBox, QListWidget, QTextEdit, QMessageBox,
+    QFileDialog, QLabel, QLineEdit, QCheckBox, QFormLayout, QComboBox
 )
 from PyQt6.QtCore import pyqtSignal, pyqtSlot, QThread, QObject
 from PyQt6.QtGui import QCloseEvent, QIntValidator
 import pyqtgraph as pg
-import numpy as np
 
-from real_pulse_monitor import RealPulseMonitor
+# --- 專案檔案匯入 ---
 from pulse_monitor_interface import PulseDiagnosisInterface, DeviceStatus, SensorDataPoint
+from fake_pulse_monitor import FakePulseMonitor
+from real_pulse_monitor import RealPulseMonitor
+from similarity_predictor import load_specific_database, find_most_similar, extract_features
 from rag_example import RAGApplication
-from analysis_sender import push_analysis_from_text
-from pulse_parser import parse_pulse_report
 
 MAX_PLOT_POINTS = 500
 
 class RAGWorker(QObject):
     query_finished = pyqtSignal(str, str)
     def __init__(self, rag_app_instance: RAGApplication):
-        super().__init__(); self.rag_app = rag_app_instance
+        super().__init__()
+        self.rag_app = rag_app_instance
+    
     @pyqtSlot(str, str)
     def run_query(self, position_name: str, query_text: str):
         if self.rag_app:
             try:
                 response = self.rag_app.query(query_text)
                 self.query_finished.emit(position_name, response)
-            except Exception as e: self.query_finished.emit(position_name, f"RAG 查詢出錯: {e}")
-        else: self.query_finished.emit(position_name, "RAG 應用未初始化。")
-
-class CustomLevelDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("自訂各部壓力"); layout = QVBoxLayout(self); self.selectors = {}
-        positions = ['寸', '關', '尺']; levels = list(PulseDiagnosisInterface.PressureLevel)
-        for pos in positions:
-            row_layout = QHBoxLayout(); label = QLabel(f"{pos}部壓力:"); combo = QComboBox()
-            for level in levels: combo.addItem(level.name, level)
-            self.selectors[pos] = combo; row_layout.addWidget(label); row_layout.addWidget(combo); layout.addLayout(row_layout)
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        button_box.accepted.connect(self.accept); button_box.rejected.connect(self.reject); layout.addWidget(button_box)
-    def get_selected_levels(self) -> list[PulseDiagnosisInterface.PressureLevel]:
-        return [self.selectors['寸'].currentData(), self.selectors['關'].currentData(), self.selectors['尺'].currentData()]
+            except Exception as e:
+                self.query_finished.emit(position_name, f"RAG 查詢出錯: {e}")
+        else:
+            self.query_finished.emit(position_name, "RAG 應用未初始化。")
 
 class PulseMonitorGUI(QMainWindow):
+    status_updated_signal = pyqtSignal(DeviceStatus)
+    devices_found_signal = pyqtSignal(list)
+    data_received_signal = pyqtSignal(list)
+    log_message_signal = pyqtSignal(str)
     start_rag_query = pyqtSignal(str, str)
-    status_updated_signal = pyqtSignal(DeviceStatus); devices_found_signal = pyqtSignal(list)
-    data_received_signal = pyqtSignal(list); log_message_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("智慧中醫脈診輔助系統 (RAG版)"); self.setGeometry(100, 100, 1600, 800)
+        self.setWindowTitle("智慧中醫脈診輔助系統 (整合版)")
+        self.setGeometry(100, 100, 1200, 800)
+        
         self.monitor: PulseDiagnosisInterface = RealPulseMonitor()
-        self.monitor.register_event_callback(self._event_handler)
-        self.discovered_devices = []; self.is_measuring = False; self.current_status: Optional[DeviceStatus] = None
-        self.selected_hand_for_measurement: Optional[str] = None
-        self.time_data = deque(maxlen=MAX_PLOT_POINTS); self.cun_data = deque(maxlen=MAX_PLOT_POINTS)
-        self.guan_data = deque(maxlen=MAX_PLOT_POINTS); self.chi_data = deque(maxlen=MAX_PLOT_POINTS)
+        
+        self.is_measuring = False
+        self.current_status: Optional[DeviceStatus] = None
+        self.discovered_devices: List[dict] = []
+
+        self.plot_time_data = deque(maxlen=MAX_PLOT_POINTS)
+        self.plot_cun_data = deque(maxlen=MAX_PLOT_POINTS)
+        self.plot_guan_data = deque(maxlen=MAX_PLOT_POINTS)
+        self.plot_chi_data = deque(maxlen=MAX_PLOT_POINTS)
+        self.full_measurement_data: List[SensorDataPoint] = []
         self.measurement_start_time: Optional[int] = None
-        self.sample_rate = 120; self.filter_lowcut = 0.5; self.filter_highcut = 15.0
-        self.filter_order = 3; self.MIN_PULSE_AMPLITUDE_PA = 15.0
-        self.current_analysis_results = {}; self.combined_analysis_to_send = {}
-        self._setup_ui(); self._connect_signals()
+        
+        self.current_analysis_results = {}
+
+        self._setup_ui()
+        self._connect_signals()
+
         self.rag_app = None
         try:
             print("正在初始化 RAG 知識庫...")
-            self.rag_app = RAGApplication(data_dir="data"); self.rag_app.build_index(); print("RAG 知識庫準備就緒！")
-            self.rag_thread = QThread(); self.rag_worker = RAGWorker(self.rag_app)
-            self.rag_worker.moveToThread(self.rag_thread); self.start_rag_query.connect(self.rag_worker.run_query)
+            self.rag_app = RAGApplication(data_dir="data"); self.rag_app.build_index()
+            print("RAG 知識庫準備就緒！")
+            
+            self.rag_thread = QThread()
+            self.rag_worker = RAGWorker(self.rag_app)
+            self.rag_worker.moveToThread(self.rag_thread)
+            self.start_rag_query.connect(self.rag_worker.run_query)
             self.rag_worker.query_finished.connect(self._on_rag_query_finished)
-            self.rag_thread.finished.connect(self.rag_worker.deleteLater); self.rag_thread.start(); print("RAG 背景查詢執行緒已啟動。")
+            self.rag_thread.start()
+            print("RAG 背景查詢執行緒已啟動。")
         except Exception as e:
-            print(f"❌ RAG 知識庫初始化失敗: {e}"); QMessageBox.warning(self, "警告", f"RAG 知識庫初始化失敗，詳細問答功能將不可用。\n錯誤: {e}")
-        self.log_message_signal.emit("程式已啟動，請掃描設備。")
+            print(f"❌ RAG 知識庫初始化失敗: {e}"); QMessageBox.warning(self, "警告", f"RAG 知識庫初始化失敗。\n錯誤: {e}")
 
-    def _filter_signal(self, data: np.ndarray) -> np.ndarray:
-        nyquist = 0.5 * self.sample_rate; low = self.filter_lowcut / nyquist; high = self.filter_highcut / nyquist
-        b, a = butter(self.filter_order, [low, high], btype='band'); filtered_data = filtfilt(b, a, data)
-        return filtered_data
-
-    def _get_pulse_name_from_features(self, features: dict) -> str:
-        if "error" in features: return "分析失敗"
-        avg_p, hr, amp = features["avg_pressure_pa"], features["heart_rate_bpm"], features["avg_amplitude_pa"]
-        pulse_characteristics: List[str] = []
-        if avg_p < 13000: pulse_characteristics.append("浮")
-        elif avg_p > 18000: pulse_characteristics.append("沉")
-        if hr < 60: pulse_characteristics.append("遲")
-        elif hr > 90: pulse_characteristics.append("數")
-        if amp < 150: pulse_characteristics.append("虛")
-        elif amp > 250: pulse_characteristics.append("實")
-        return "-".join(pulse_characteristics) + "脈" if pulse_characteristics else "平脈"
-        
-    def _update_display_from_results(self):
-        html_output = "<html><body style='font-family: Arial, sans-serif;'>"
-        hand_text = '左' if self.selected_hand_for_measurement == 'left' else '右'
-        display_order = [f"寸部 ({hand_text})", f"關部 ({hand_text})", f"尺部 ({hand_text})"]
-        for pos_key in display_order:
-            if pos_key not in self.current_analysis_results: continue
-            result = self.current_analysis_results[pos_key]
-            html_output += f'<p align="center" style="font-size: 16px;"><b>--- {result["full_name"]} 分析 ---</b></p>'
-            html_output += f"<pre><b>量化特徵:</b> {result['features_str']}\n<b>傳統脈象:</b> {result['pulse_name']}</pre>"
-            rag_html = markdown.markdown(result['rag_response'], extensions=['fenced_code', 'tables'])
-            html_output += rag_html + "<hr>"
-        html_output += "</body></html>"; self.analysis_result_text.setHtml(html_output)
-
-    def _extract_features(self, time_s: np.ndarray, pressure_pa: np.ndarray) -> Dict[str, Any]:
-        if len(pressure_pa) < self.sample_rate * 2: return {"error": "數據點過少，無法進行有效分析"}
-        filtered_pressure = self._filter_signal(pressure_pa)
-        avg_pressure_pa = np.mean(pressure_pa)
-        pulse_wave = filtered_pressure - np.mean(filtered_pressure)
-        peak_height_threshold = max(np.std(pulse_wave) * 0.7, self.MIN_PULSE_AMPLITUDE_PA)
-        peaks, _ = find_peaks(pulse_wave, height=peak_height_threshold, distance=self.sample_rate * 0.4)
-        if len(peaks) < 3: return {"error": f"清晰波峰數量不足 (僅找到 {len(peaks)} 個)"}
-        avg_peak_interval_s = np.mean(np.diff(time_s[peaks]))
-        heart_rate_bpm = 60.0 / avg_peak_interval_s if avg_peak_interval_s > 0 else 0
-        avg_amplitude_pa = np.mean(pulse_wave[peaks])
-        return {"avg_pressure_pa": round(avg_pressure_pa, 2), "heart_rate_bpm": round(heart_rate_bpm, 2), "avg_amplitude_pa": round(avg_amplitude_pa, 2), "peak_count": len(peaks)}
-    
-    def _describe_features_to_text(self, features: dict) -> str:
-        p_desc, a_desc, h_desc = "正常範圍", "正常範圍", "正常範圍"
-        if features['avg_pressure_pa'] < 13000: p_desc = "顯著偏低"
-        elif features['avg_pressure_pa'] > 18000: p_desc = "顯著偏高"
-        if features['avg_amplitude_pa'] < 150: a_desc = "微弱"
-        elif features['avg_amplitude_pa'] > 250: a_desc = "強勁有力"
-        if features['heart_rate_bpm'] < 60: h_desc = "過緩"
-        elif features['heart_rate_bpm'] > 90: h_desc = "過快"
-        return f"平均壓力{p_desc}、脈搏振幅{a_desc}、且心率{h_desc}"
+        self._on_fake_monitor_toggled(self.use_fake_monitor_checkbox.isChecked())
+        self.log_message_signal.emit("程式已啟動。")
 
     def _setup_ui(self):
         main_widget = QWidget(); self.setCentralWidget(main_widget); main_layout = QHBoxLayout(main_widget)
         left_panel = QWidget(); left_layout = QVBoxLayout(left_panel); left_panel.setFixedWidth(320)
         conn_group = QGroupBox("連接控制"); conn_layout = QVBoxLayout(conn_group)
-        self.scan_button = QPushButton("掃描附近設備"); self.device_list_widget = QListWidget()
-        self.connect_button = QPushButton("連接選定設備"); self.disconnect_button = QPushButton("斷開連接")
-        self.reset_button = QPushButton("設備重置 (Reset)")
-        conn_layout.addWidget(self.scan_button); conn_layout.addWidget(self.device_list_widget)
-        conn_layout.addWidget(self.connect_button); conn_layout.addWidget(self.disconnect_button); conn_layout.addWidget(self.reset_button)
-        measure_group = QGroupBox("測量控制"); measure_layout = QVBoxLayout(measure_group)
-        hand_layout = QHBoxLayout(); hand_label = QLabel("測量手："); self.hand_selector = QComboBox()
-        self.hand_selector.addItem("左手", "left"); self.hand_selector.addItem("右手", "right")
-        hand_layout.addWidget(hand_label); hand_layout.addWidget(self.hand_selector); measure_layout.addLayout(hand_layout)
-        duration_layout = QHBoxLayout(); duration_layout.addWidget(QLabel("測量時長 (5-60秒):"))
-        self.duration_input = QLineEdit("20"); self.duration_input.setValidator(QIntValidator(5, 60)); self.duration_input.setFixedWidth(50)
-        duration_layout.addWidget(self.duration_input); duration_layout.addStretch(); measure_layout.addLayout(duration_layout)
-        self.profile_radio = QRadioButton("使用便捷模式"); self.profile_combo = QComboBox(); self.profile_radio.setChecked(True)
-        for profile in PulseDiagnosisInterface.MeasurementProfile: self.profile_combo.addItem(profile.name, profile)
-        self.custom_radio = QRadioButton("自訂各部壓力")
-        measure_layout.addWidget(self.profile_radio); measure_layout.addWidget(self.profile_combo); measure_layout.addWidget(self.custom_radio)
-        self.profile_radio.toggled.connect(self.profile_combo.setEnabled)
+        self.use_fake_monitor_checkbox = QCheckBox("使用虛擬設備"); conn_layout.addWidget(self.use_fake_monitor_checkbox)
+        self.scan_button = QPushButton("掃描附近設備"); conn_layout.addWidget(self.scan_button)
+        self.device_list_widget = QListWidget(); conn_layout.addWidget(self.device_list_widget)
+        self.connect_button = QPushButton("連接選定設備"); conn_layout.addWidget(self.connect_button)
+        self.disconnect_button = QPushButton("斷開連接"); conn_layout.addWidget(self.disconnect_button)
+        self.reset_button = QPushButton("設備重置 (Reset)"); conn_layout.addWidget(self.reset_button)
+        
+        measure_group = QGroupBox("測量設定"); measure_layout = QVBoxLayout(measure_group)
+        settings_layout = QFormLayout()
+        self.duration_input = QLineEdit("20")
+        self.duration_input.setValidator(QIntValidator(5, 60))
+        settings_layout.addRow("測量時長 (秒):", self.duration_input)
+        
+        self.measure_pressure_combo = QComboBox()
+        self.measure_pressure_combo.addItem("浮", PulseDiagnosisInterface.PressureLevel.FLOATING)
+        self.measure_pressure_combo.addItem("中", PulseDiagnosisInterface.PressureLevel.MIDDLE)
+        self.measure_pressure_combo.addItem("沉", PulseDiagnosisInterface.PressureLevel.SINKING)
+        self.measure_pressure_combo.setCurrentIndex(1) # 預設選中「中」
+        settings_layout.addRow("測量壓力層級:", self.measure_pressure_combo)
+
+        measure_layout.addLayout(settings_layout)
+        
+        self.sim_settings_group = QGroupBox("虛擬設備模擬設定"); sim_layout = QFormLayout(self.sim_settings_group)
+        self.simulation_profile_combo = QComboBox()
+        for profile in PulseDiagnosisInterface.MeasurementProfile:
+            self.simulation_profile_combo.addItem(profile.name, profile)
+        sim_layout.addRow("模擬脈象:", self.simulation_profile_combo)
+        self.sim_settings_group.setVisible(False)
+        measure_layout.addWidget(self.sim_settings_group)
+        
         self.start_button = QPushButton("開始測量"); self.stop_button = QPushButton("緊急停止")
-        self.set_pressure_button = QPushButton("手動設壓 (不採樣)"); self.save_button = QPushButton("儲存數據為 CSV")
-        measure_layout.addWidget(self.start_button); measure_layout.addWidget(self.stop_button)
-        measure_layout.addWidget(self.set_pressure_button); measure_layout.addWidget(self.save_button)
-        patient_group = QGroupBox("患者資訊 (影響劑量建議)"); patient_layout = QFormLayout(patient_group)
-        self.weight_input = QLineEdit(); self.weight_input.setPlaceholderText("例如: 65"); self.weight_input.setValidator(QIntValidator(0, 300))
-        self.is_pregnant_checkbox = QCheckBox()
-        patient_layout.addRow("體重 (kg):", self.weight_input); patient_layout.addRow("是否為孕婦:", self.is_pregnant_checkbox)
-        left_layout.addWidget(conn_group); left_layout.addWidget(measure_group); left_layout.addWidget(patient_group); left_layout.addStretch()
-        center_panel = QWidget(); center_layout = QVBoxLayout(center_panel)
-        plot_group = QGroupBox("即時脈搏波形"); plot_layout = QVBoxLayout(plot_group)
-        self.plot_widget = pg.GraphicsLayoutWidget(); plot_layout.addWidget(self.plot_widget); self.plot_widget.setBackground('w')
-        self.cun_plot = self.plot_widget.addPlot(row=0, col=0); self.guan_plot = self.plot_widget.addPlot(row=1, col=0)
-        self.chi_plot = self.plot_widget.addPlot(row=2, col=0); self.cun_plot.setLabel('left', '寸部 (Pa)', color='r')
-        self.guan_plot.setLabel('left', '關部 (Pa)', color='g'); self.chi_plot.setLabel('left', '尺部 (Pa)', color='b')
-        self.chi_plot.setLabel('bottom', '經過時間 (ms)'); self.guan_plot.setXLink(self.cun_plot); self.chi_plot.setXLink(self.cun_plot)
-        self.cun_curve = self.cun_plot.plot(pen=pg.mkPen('r', width=2)); self.guan_curve = self.guan_plot.plot(pen=pg.mkPen('g', width=2))
-        self.chi_curve = self.chi_plot.plot(pen=pg.mkPen('b', width=2))
+        self.save_button = QPushButton("儲存原始數據為 CSV")
+        measure_layout.addWidget(self.start_button); measure_layout.addWidget(self.stop_button); measure_layout.addWidget(self.save_button)
+        
+        patient_group = QGroupBox("患者資訊"); patient_layout = QFormLayout(patient_group)
+        self.weight_input = QLineEdit(); self.weight_input.setPlaceholderText("例如: 65")
+        self.weight_input.setValidator(QIntValidator(0, 300))
+        self.is_pregnant_checkbox = QCheckBox(); patient_layout.addRow("體重 (kg):", self.weight_input)
+        patient_layout.addRow("是否為孕婦:", self.is_pregnant_checkbox)
+        
+        left_layout.addWidget(conn_group); left_layout.addWidget(measure_group)
+        left_layout.addWidget(patient_group); left_layout.addStretch()
+        
+        center_panel = QWidget(); center_layout = QVBoxLayout(center_panel); plot_group = QGroupBox("即時脈搏波形")
+        plot_layout = QVBoxLayout(plot_group); self.plot_widget = pg.GraphicsLayoutWidget(); plot_layout.addWidget(self.plot_widget)
+        self.plot_widget.setBackground('w'); self.cun_plot = self.plot_widget.addPlot(row=0, col=0, title="寸部")
+        self.guan_plot = self.plot_widget.addPlot(row=1, col=0, title="關部"); self.chi_plot = self.plot_widget.addPlot(row=2, col=0, title="尺部")
+        self.chi_plot.setLabel('bottom', '經過時間 (ms)'); self.cun_curve = self.cun_plot.plot(pen=pg.mkPen('r', width=2))
+        self.guan_curve = self.guan_plot.plot(pen=pg.mkPen('g', width=2)); self.chi_curve = self.chi_plot.plot(pen=pg.mkPen('b', width=2))
         for plot_item in [self.cun_plot, self.guan_plot, self.chi_plot]: plot_item.showGrid(x=True, y=True, alpha=0.3)
-        center_layout.addWidget(plot_group); right_panel = QWidget(); right_layout = QVBoxLayout(right_panel); right_panel.setFixedWidth(450)
-        analysis_group = QGroupBox("初步分析結果"); analysis_layout = QVBoxLayout(analysis_group)
-        self.analysis_result_text = QTextEdit(); self.analysis_result_text.setReadOnly(True); self.analysis_result_text.setPlaceholderText("測量完成後，此處將顯示分析結果...")
-        analysis_layout.addWidget(self.analysis_result_text); log_group = QGroupBox("狀態與日誌"); log_layout = QVBoxLayout(log_group)
-        self.log_text = QTextEdit(); self.log_text.setReadOnly(True); log_layout.addWidget(self.log_text)
-        right_layout.addWidget(analysis_group, 1); right_layout.addWidget(log_group, 0); log_group.setFixedHeight(200)
-        main_layout.addWidget(left_panel, 0); main_layout.addWidget(center_panel, 1); main_layout.addWidget(right_panel, 0)
+        center_layout.addWidget(plot_group)
+        
+        right_panel = QWidget(); right_layout = QVBoxLayout(right_panel); right_panel.setFixedWidth(450)
+        analysis_group = QGroupBox("分析報告"); analysis_layout = QVBoxLayout(analysis_group)
+        self.analysis_result_text = QTextEdit(); self.analysis_result_text.setReadOnly(True)
+        self.analysis_result_text.setPlaceholderText("測量完成後，此處將顯示完整分析報告..."); analysis_layout.addWidget(self.analysis_result_text)
+        self.save_report_button = QPushButton("儲存分析報告為 TXT"); self.save_report_button.setEnabled(False)
+        analysis_layout.addWidget(self.save_report_button)
+        log_group = QGroupBox("狀態與日誌"); log_layout = QVBoxLayout(log_group); self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True); self.log_text.setFixedHeight(200); log_layout.addWidget(self.log_text)
+        right_layout.addWidget(analysis_group); right_layout.addWidget(log_group)
+        main_layout.addWidget(left_panel); main_layout.addWidget(center_panel, 1); main_layout.addWidget(right_panel)
 
     def _connect_signals(self):
         self.scan_button.clicked.connect(self._handle_scan); self.connect_button.clicked.connect(self._handle_connect)
         self.disconnect_button.clicked.connect(self._handle_disconnect); self.start_button.clicked.connect(self._handle_start_measurement)
         self.stop_button.clicked.connect(self._handle_stop); self.save_button.clicked.connect(self._handle_save_data)
-        self.reset_button.clicked.connect(self._handle_reset); self.set_pressure_button.clicked.connect(self._handle_set_pressure)
-        self.status_updated_signal.connect(self._update_status_display); self.devices_found_signal.connect(self._update_device_list)
-        self.data_received_signal.connect(self._update_plot_and_data); self.log_message_signal.connect(self._append_log_message)
+        self.reset_button.clicked.connect(self._handle_reset); self.use_fake_monitor_checkbox.toggled.connect(self._on_fake_monitor_toggled)
+        self.save_report_button.clicked.connect(self._handle_save_report); self.status_updated_signal.connect(self._update_status_display)
+        self.devices_found_signal.connect(self._update_device_list); self.data_received_signal.connect(self._update_plot_and_data)
+        self.log_message_signal.connect(self._append_log_message)
+        # --- 【修正 1】當設備列表的選擇項目改變時，也去觸發一次狀態更新，以確保「連接」按鈕狀態正確 ---
+        self.device_list_widget.currentItemChanged.connect(lambda: self._update_status_display(self.current_status))
 
-    def _event_handler(self, event):
-        if isinstance(event, DeviceStatus): self.status_updated_signal.emit(event)
-        elif isinstance(event, list) and event and isinstance(event[0], dict): self.devices_found_signal.emit(event)
-        elif isinstance(event, list) and event and isinstance(event[0], SensorDataPoint): self.data_received_signal.emit(event)
-        elif isinstance(event, list) and not event: self.devices_found_signal.emit(event)
-        else: self.log_message_signal.emit(f"[未知事件] 收到無法識別的事件: {type(event)}")
 
-    @pyqtSlot(str)
-    def _append_log_message(self, message): self.log_text.append(message); s = self.log_text.verticalScrollBar(); s.setValue(s.maximum())
+    @pyqtSlot(bool)
+    def _on_fake_monitor_toggled(self, checked: bool):
+        if self.monitor.is_connected():
+            QMessageBox.warning(self, "模式切換失敗", "請先斷開當前設備連接。")
+            # --- 【修正 2】在用程式碼改變 Checkbox 狀態前，先阻斷信號，完成後再恢復，避免無限循環 ---
+            self.use_fake_monitor_checkbox.blockSignals(True)
+            try:
+                self.use_fake_monitor_checkbox.setChecked(not checked)
+            finally:
+                self.use_fake_monitor_checkbox.blockSignals(False)
+            return
+        
+        self.sim_settings_group.setVisible(checked)
+        self.monitor.shutdown()
+        if checked: self.log_message_signal.emit("[系統] 已切換至虛擬設備模式。"); self.monitor = FakePulseMonitor()
+        else: self.log_message_signal.emit("[系統] 已切換至真實硬體模式。"); self.monitor = RealPulseMonitor()
+        self.monitor.register_event_callback(self._event_handler); self._update_status_display(DeviceStatus.DISCONNECTED)
+
+    def _handle_start_measurement(self):
+        self.full_measurement_data.clear(); self.plot_time_data.clear(); self.plot_cun_data.clear()
+        self.plot_guan_data.clear(); self.plot_chi_data.clear(); self.analysis_result_text.clear()
+        self.measurement_start_time = None; self.save_report_button.setEnabled(False); self.current_analysis_results = {}
+        try: duration = int(self.duration_input.text())
+        except (ValueError, TypeError): duration = 20
+        
+        if self.use_fake_monitor_checkbox.isChecked():
+            selected_profile = self.simulation_profile_combo.currentData()
+            self.log_message_signal.emit(f"開始模擬 '{selected_profile.name}'，時長 {duration} 秒...")
+            self.monitor.start_measurement_by_profile(selected_profile, duration_s=duration)
+        else:
+            selected_level_text = self.measure_pressure_combo.currentText()
+            selected_level_enum = self.measure_pressure_combo.currentData()
+            
+            self.log_message_signal.emit(f"開始 '{selected_level_text}' 級壓力測量，時長 {duration} 秒...")
+            self.monitor.start_measurement_by_level([selected_level_enum] * 3, duration_s=duration)
 
     @pyqtSlot(DeviceStatus)
     def _update_status_display(self, status: DeviceStatus):
         previous_status = self.current_status; self.current_status = status
-        self.log_message_signal.emit(f"[狀態更新] >> 設備狀態變更為: {status.name}")
-        is_connected = self.monitor.is_connected(); self.is_measuring = status == DeviceStatus.MEASURING
-        self.scan_button.setEnabled(not is_connected); self.connect_button.setEnabled(not is_connected and self.device_list_widget.count() > 0)
+        # 即使傳入的 status 是 None (例如程式剛啟動時觸發currentItemChanged)，也要保護起來
+        if status is not None:
+            self.log_message_signal.emit(f"設備狀態: {status.name}")
+        
+        is_connected = self.monitor.is_connected()
+        self.is_measuring = status == DeviceStatus.MEASURING if status else False
+        is_fake_mode = self.use_fake_monitor_checkbox.isChecked()
+
+        self.scan_button.setEnabled(not is_connected and not is_fake_mode)
+        self.connect_button.setEnabled(not is_connected and (is_fake_mode or self.device_list_widget.currentItem() is not None))
         self.disconnect_button.setEnabled(is_connected); self.reset_button.setEnabled(is_connected)
-        self.start_button.setEnabled(is_connected and not self.is_measuring); self.set_pressure_button.setEnabled(is_connected and not self.is_measuring)
-        self.stop_button.setEnabled(is_connected and self.is_measuring); self.save_button.setEnabled(not self.is_measuring and len(self.time_data) > 0)
-        if (previous_status == DeviceStatus.MEASURING or previous_status == DeviceStatus.STOPPING) and \
-            status == DeviceStatus.CONNECTED_IDLE and self.time_data:
-            self.log_message_signal.emit("[提示] >> 操作結束，正在進行數據分析...")
-            if self.selected_hand_for_measurement: self._run_and_display_analysis(self.selected_hand_for_measurement)
+        self.start_button.setEnabled(is_connected and not self.is_measuring); self.stop_button.setEnabled(is_connected and self.is_measuring)
+        self.save_button.setEnabled(not self.is_measuring and len(self.full_measurement_data) > 0)
+        
+        if (previous_status in [DeviceStatus.MEASURING, DeviceStatus.STOPPING]) and \
+           (status == DeviceStatus.CONNECTED_IDLE) and self.full_measurement_data:
+            self.log_message_signal.emit("操作結束，正在進行整合分析..."); self._run_integrated_analysis()
 
-    @pyqtSlot(list)
-    def _update_device_list(self, devices):
-        self.log_message_signal.emit(f"[掃描結果] >> 發現 {len(devices)} 個設備。"); self.device_list_widget.clear()
-        self.discovered_devices = devices
-        if not devices: self.device_list_widget.addItem("未發現任何設備")
-        else:
-            for device in devices: self.device_list_widget.addItem(f"{device.get('name', 'N/A')} ({device.get('address', 'N/A')})")
-        self._update_status_display(DeviceStatus.DISCONNECTED)
+    def _describe_features_from_vector(self, features: np.ndarray) -> str:
+        if features is None or len(features) < 7: return "特徵數據不足"
+        desc = (f"波形平均值 {features[0]:.1f}，標準差 {features[1]:.1f} (反映穩定性)，振幅範圍 {features[3]:.1f} - {features[2]:.1f}，"
+                f"變化率均值 {features[4]:.1f}，變化率標準差 {features[5]:.1f} (反映銳利度)，共偵測到 {int(features[6])} 個主要波峰。")
+        return desc
 
-    # --- 恢復被遺漏的函式 ---
-    def _run_and_display_analysis(self, selected_hand: str):
-        if not self.time_data: self.analysis_result_text.setText("分析失敗：沒有數據。"); return
-        if not self.rag_app: self.analysis_result_text.setText("分析失敗：RAG知識庫未載入。"); return
-        self.current_analysis_results = {}; self.combined_analysis_to_send = {}
-        weight_str = self.weight_input.text().strip(); is_pregnant = self.is_pregnant_checkbox.isChecked()
-        patient_context = f"一位病人的基本情況是：體重約為 {weight_str if weight_str else '未提供'} 公斤。"
-        if is_pregnant: patient_context += " **目前處於懷孕狀態**。"
-        else: patient_context += " 非懷孕狀態。"
-        all_data_to_analyze = {'time_s': np.array(list(self.time_data))/1000.0, 'cun': np.array(list(self.cun_data)), 'guan': np.array(list(self.guan_data)), 'chi': np.array(list(self.chi_data))}
-        hand_text = '左' if selected_hand == 'left' else '右'
-        for pos, name in [('cun', '寸'), ('guan', '關'), ('chi', '尺')]:
-            features = self._extract_features(all_data_to_analyze['time_s'], all_data_to_analyze[pos])
-            full_position_name = f"{name}部 ({hand_text})"
-            if "error" in features:
-                self.current_analysis_results[full_position_name] = {
-                    'full_name': full_position_name, 'features_str': f"分析失敗: {features['error']}",
-                    'pulse_name': "無法判斷", 'rag_response': f"<h4>分析錯誤</h4><p>無法從訊號中提取有效特徵 ({features['error']})。</p>"
-                }; continue
-            self.current_analysis_results[full_position_name] = {
-                'full_name': full_position_name, 'features_str': f"心率: {features.get('heart_rate_bpm', 'N/A')} | 振幅: {features.get('avg_amplitude_pa', 'N/A')} | 平均壓力: {features.get('avg_pressure_pa', 'N/A')}",
-                'pulse_name': self._get_pulse_name_from_features(features), 'rag_response': '<h4>RAG 知識庫診斷詳解</h4><p>正在查詢中，請稍候...</p>'
-            }
-            feature_description = self._describe_features_to_text(features)
+    def _run_integrated_analysis(self):
+        if not self.full_measurement_data: return
+        
+        pressure_level = self.measure_pressure_combo.currentText()
+        self.log_message_signal.emit(f"使用手動設定的壓力級別 '{pressure_level}' 進行比對...")
+        
+        ref_features, ref_labels, ref_scaler = load_specific_database(pressure_level)
+        if ref_features is None: self.analysis_result_text.setText(f"錯誤：無法載入 '{pressure_level}' 級數據庫。"); return
+
+        positions_to_analyze = ['寸', '關', '尺']; start_time = self.full_measurement_data[0].timestamp_ms
+        pos_map = {'寸': 'pressure_pa_cun', '關': 'pressure_pa_guan', '尺': 'pressure_pa_chi'}
+        
+        self.analysis_result_text.setHtml("<html><body><h4>正在進行初步比對與深度分析...</h4></body></html>")
+
+        for position in positions_to_analyze:
+            timestamps = [dp.timestamp_ms - start_time for dp in self.full_measurement_data]
+            pressures = [getattr(dp, pos_map[position]) for dp in self.full_measurement_data]
+            temp_df = pd.DataFrame({'timestamp': timestamps, 'pressure': pressures})
+            temp_csv_path = f"temp_waveform_{position}.csv"
+            temp_df.to_csv(temp_csv_path, index=False, header=False)
+            sim_results = find_most_similar(temp_csv_path, ref_features, ref_labels, ref_scaler)
+            if isinstance(sim_results, dict): preliminary_pulse_name = sim_results.get('最相似的標準樣本', '比對失敗')
+            else: preliminary_pulse_name = "比對失敗"
+            waveform_data = temp_df.to_numpy(); current_features_vec = extract_features(waveform_data)
+            feature_description = self._describe_features_from_vector(current_features_vec)
+            patient_context = f"一位病人的基本情況是：體重約為 {self.weight_input.text() or '未提供'} 公斤。"
+            if self.is_pregnant_checkbox.isChecked(): patient_context += " **目前處於懷孕狀態**。"
             query_text = (
-                "你是一位專業的中醫師。請嚴格依下列『制式化輸出合約』與『標準輸出模板』作答，只根據提供的病人與脈象資訊，不得加入任何多餘說明或提問。\n【制式化輸出合約】\n- 僅輸出模板內容；禁止額外對話/開場白/結語/解說。\n- 標題與順序必須完全一致，包含首行 。\n- 劑量欄位僅填數字（可含一位小數），不得附加 g 或括號備註；準備/先煎等寫在「煎服方法」。\n- 若暫不開藥：表格僅保留表頭；「煎服方法：不需煎服」；休息/保暖/觀察等寫在「用藥禁忌與注意事項」。\n- 「暫不建議使用中藥」等同義語句全文最多一次，且僅能出現在「用藥禁忌與注意事項」。\n- 僅允許在「用藥禁忌與注意事項」用項目符號（- ），不得用破折/連字號作分隔線。\n- 不得新增/刪減/改動任何標題文字；不得使用除模板外的  或**或 ####。\n- 資訊不足時仍須依現有資料完成判斷，不得向使用者追問。\n\n### 病人資訊\n{patient_context}\n\n### 脈象資訊\n- 位置: {hand_text}手{name}部\n- 特徵描述: '{feature_description}'\n\n請直接輸出下列『標準輸出模板』，以填入內容的方式給出最終答案：\n####脈象判斷\n[此處填寫您對脈象的判斷]\n\n####證候診斷 (總結)\n[此處填寫您對具體病症的診斷]\n\n####個人化用藥建議 (含劑量)\n| 藥材 | 劑量 (g/日) | 作用 |\n| :--- | :--- | :--- |\n| [藥材1] | [劑量1] | [作用1] |\n| [藥材2] | [劑量2] | [作用2] |\n\n**煎服方法**：[此處填寫煎服方法]\n\n#### 用藥禁忌與注意事項\n- [注意事項1]\n- [注意事項2]\n"
-            ).format(patient_context=patient_context, hand_text=hand_text, name=name, feature_description=feature_description)
+                "你是一位專業的中醫師。請嚴格依下列『制式化輸出合約』與『標準輸出模板』作答，只根據提供的病人與脈象資訊，不得加入任何多餘說明或提問。\n【制式化輸出合約】\n- 僅輸出模板內容；禁止額外對話/開場白/結語/解說。\n- 標題與順序必須完全一致，包含首行 。\n- 劑量欄位僅填數字（可含一位小數），不得附加 g 或括號備註；準備/先煎等寫在「煎服方法」。\n- 若暫不開藥：表格僅保留表頭；「煎服方法：不需煎服」；休息/保暖/觀察等寫在「用藥禁忌與注意事項」。\n- 「暫不建議使用中藥」等同義語句全文最多一次，且僅能出現在「用藥禁忌與注意事項」。\n- 僅允許在「用藥禁忌與注意事項」用項目符號（- ），不得用破折/連字號作分隔線。\n- 不得新增/刪減/改動任何標題文字；不得使用除模板外的 ` 或**或 ####。\n- 資訊不足時仍須依現有資料完成判斷，不得向使用者追問。\n\n### 病人資訊\n{patient_context}\n\n### 脈象資訊\n- 位置: {hand}手{position}部 ({pressure_level}脈)\n- 初步比對脈象: **{pulse_name}**\n- 特徵描述: '{feature_description}'\n\n請直接輸出下列『標準輸出模板』，以填入內容的方式給出最終答案：\n####脈象判斷\n[此處填寫您對脈象的判斷]\n\n####證候診斷 (總結)\n[此處填寫您對具體病症的診斷]\n\n####個人化用藥建議 (含劑量)\n| 藥材 | 劑量 (g/日) | 作用 |\n| :--- | :--- | :--- |\n| [藥材1] | [劑量1] | [作用1] |\n| [藥材2] | [劑量2] | [作用2] |\n\n**煎服方法**：[此處填寫煎服方法]\n\n#### 用藥禁忌與注意事項\n- [注意事項1]\n- [注意事項2]\n"
+            ).format(patient_context=patient_context, hand='左', position=position, pressure_level=pressure_level, pulse_name=preliminary_pulse_name, feature_description=feature_description)
+            full_position_name = f"{position}部 ({pressure_level}脈)"
+            self.current_analysis_results[full_position_name] = {'sim_results': sim_results, 'features_str': feature_description, 'rag_response': '<h4>正在等候 RAG 系統回覆...</h4>'}
             self.start_rag_query.emit(full_position_name, query_text)
-        self._update_display_from_results()
-    
-    @pyqtSlot(list)
-    def _update_plot_and_data(self, data_points: List[SensorDataPoint]):
-        for dp in data_points:
-            if self.measurement_start_time is None: self.measurement_start_time = dp.timestamp_ms
-            relative_time_ms = dp.timestamp_ms - self.measurement_start_time
-            self.time_data.append(relative_time_ms); self.cun_data.append(dp.pressure_pa_cun)
-            self.guan_data.append(dp.pressure_pa_guan); self.chi_data.append(dp.pressure_pa_chi)
-        self.cun_curve.setData(list(self.time_data), list(self.cun_data))
-        self.guan_curve.setData(list(self.time_data), list(self.guan_data))
-        self.chi_curve.setData(list(self.time_data), list(self.chi_data))
 
     @pyqtSlot(str, str)
     def _on_rag_query_finished(self, position_name: str, rag_response: str):
         if position_name in self.current_analysis_results:
             self.current_analysis_results[position_name]['rag_response'] = rag_response
-            self.combined_analysis_to_send[position_name] = rag_response
-            hand_text = '左' if self.selected_hand_for_measurement == 'left' else '右'
-            required_positions = {f'寸部 ({hand_text})', f'關部 ({hand_text})', f'尺部 ({hand_text})'}
-            if set(self.combined_analysis_to_send.keys()) == required_positions:
-                self._update_display_from_results()
-                full_text_report = self.analysis_result_text.toPlainText()
-                try: push_analysis_from_text(full_text_report)
-                except Exception as e: print(f"[錯誤] 無法將完整的分析文本推送到後端: {e}")
-                self.combined_analysis_to_send = {}
+        if len(self.current_analysis_results) == 3 and all('rag_response' in v and '回覆' not in v['rag_response'] for v in self.current_analysis_results.values()):
             self._update_display_from_results()
 
-    def _handle_start_measurement(self):
-        self.time_data.clear(); self.cun_data.clear(); self.guan_data.clear(); self.chi_data.clear()
-        self.analysis_result_text.clear(); self.measurement_start_time = None
-        self.selected_hand_for_measurement = self.hand_selector.currentData(); hand_text = self.hand_selector.currentText()
-        try: duration = int(self.duration_input.text())
-        except (ValueError, TypeError): duration = 20; self.duration_input.setText("20")
-        self.log_message_signal.emit(f"[提示] >> 已選擇測量 {hand_text}，時長 {duration} 秒。準備開始新測量...")
-        if self.profile_radio.isChecked():
-            selected_profile = self.profile_combo.currentData()
-            self.log_message_signal.emit(f"正在使用模式 '{selected_profile.name}' 開始測量..."); self.monitor.start_measurement_by_profile(selected_profile, duration_s=duration)
-        elif self.custom_radio.isChecked():
-            dialog = CustomLevelDialog(self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                selected_levels = dialog.get_selected_levels(); level_names = [level.name for level in selected_levels]
-                self.log_message_signal.emit(f"正在以自訂壓力 [寸:{level_names[0]}, 關:{level_names[1]}, 尺:{level_names[2]}] 開始測量...")
-                self.monitor.start_measurement_by_level(selected_levels, duration_s=duration)
-            else: self.log_message_signal.emit("自訂測量已取消。")
+    def _update_display_from_results(self):
+        html_output = "<html><body>"; display_order = [key for key in sorted(self.current_analysis_results.keys(), key=lambda x: ['寸', '關', '尺'].index(x[0]))]
+        for pos_key in display_order:
+            result = self.current_analysis_results[pos_key]
+            sim_results_data = result.get('sim_results')
+            if isinstance(sim_results_data, dict): preliminary_pulse_name = sim_results_data.get('最相似的標準樣本', '比對失敗')
+            else: preliminary_pulse_name = "比對失敗"
+            html_output += f'<p align="center" style="font-size: 16px;"><b>--- {pos_key} 分析 ---</b></p>'
+            html_output += f"<pre><b>量化特徵:</b> {result['features_str']}\n<b>初步比對:</b> {preliminary_pulse_name}</pre>"
+            rag_html = markdown.markdown(result['rag_response'], extensions=['fenced_code', 'tables'])
+            html_output += f"<div>{rag_html}</div><hr>"
+        html_output += "</body></html>"; self.analysis_result_text.setHtml(html_output)
+        self.save_report_button.setEnabled(True); self.log_message_signal.emit("整合分析報告已完成！")
+        self._save_distance_report()
 
-    def _handle_scan(self): self.log_message_signal.emit("正在請求掃描設備 (持續5秒)..."); self.scan_button.setEnabled(False); self.monitor.scan_for_devices(timeout=5)
-    def _handle_connect(self):
-        selected_item = self.device_list_widget.currentItem()
-        if not selected_item: QMessageBox.warning(self, "連接錯誤", "請先在列表中選擇一個設備。"); return
-        selected_index = self.device_list_widget.currentRow()
-        if 0 <= selected_index < len(self.discovered_devices):
-            address = self.discovered_devices[selected_index].get('address')
-            if address: self.log_message_signal.emit(f"正在嘗試連接到 {address}..."); self.monitor.connect(address)
-            else: QMessageBox.critical(self, "連接錯誤", "選擇的設備沒有有效的位址。")
-        else: QMessageBox.warning(self, "連接錯誤", "請選擇一個有效的設備進行連接。")
-    def _handle_disconnect(self): self.log_message_signal.emit("正在請求斷開連接..."); self.monitor.disconnect()
-    def _handle_stop(self): self.log_message_signal.emit("正在發送緊急停止指令..."); self.monitor.stop_measurement()
-    @pyqtSlot()
-    def _handle_reset(self): self.log_message_signal.emit("正在發送設備重置指令..."); self.monitor.reset()
-    @pyqtSlot()
-    def _handle_set_pressure(self):
-        dialog = CustomLevelDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            selected_levels = dialog.get_selected_levels()
+    def _save_distance_report(self):
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S"); filename = f"pulse_distance_report_{timestamp}.txt"
+            report_content = f"脈搏波形相似度比對詳細報告\n時間: {timestamp}\n" + "=" * 40 + "\n\n"
+            display_order = [key for key in sorted(self.current_analysis_results.keys(), key=lambda x: ['寸', '關', '尺'].index(x[0]))]
+            for pos_key in display_order:
+                result = self.current_analysis_results[pos_key]; report_content += f"--- {pos_key} 比對結果 ---\n"
+                sim_data = result.get('sim_results')
+                if isinstance(sim_data, dict):
+                     report_content += f"  - {sim_data.get('最相似的標準樣本', ''):<5s} (距離: {sim_data.get('相似度(距離)', 0)})\n"
+                else: report_content += f"  - 比對失敗或無結果: {sim_data}\n"
+                report_content += "\n"
+            with open(filename, 'w', encoding='utf-8') as f: f.write(report_content)
+            self.log_message_signal.emit(f"詳細距離報告已自動儲存至: {filename}")
+        except Exception as e: self.log_message_signal.emit(f"錯誤：自動儲存距離報告失敗 - {e}")
+
+    def _handle_save_report(self):
+        report_text = self.analysis_result_text.toPlainText();
+        if not report_text: QMessageBox.warning(self, "儲存失敗", "沒有可儲存的報告內容。"); return
+        path, _ = QFileDialog.getSaveFileName(self, "儲存分析報告", "", "Text Files (*.txt)")
+        if path:
             try:
-                pressures_pa = [self.monitor.pressure_level_map[level] for level in selected_levels]; cun_pa, guan_pa, chi_pa = pressures_pa
-                self.log_message_signal.emit(f"正在手動設定壓力 -> 寸:{cun_pa:.0f}Pa, 關:{guan_pa:.0f}Pa, 尺:{chi_pa:.0f}Pa...")
-                self.monitor.set_pressure_levels_pa(cun_pa, guan_pa, chi_pa)
-            except (KeyError, AttributeError) as e:
-                self.log_message_signal.emit(f"[錯誤] 無法轉換壓力級別: {e}"); QMessageBox.warning(self, "錯誤", "無法從當前監控器獲取壓力映射，請確保已連接到真實硬體。")
-        else: self.log_message_signal.emit("手動設壓操作已取消。")
+                with open(path, 'w', encoding='utf-8') as f: f.write(report_text)
+                QMessageBox.information(self, "成功", f"分析報告已成功儲存至:\n{path}")
+            except IOError as e: QMessageBox.critical(self, "失敗", f"儲存檔案時出錯:\n{e}")
+    def _event_handler(self, event):
+        if isinstance(event, DeviceStatus): self.status_updated_signal.emit(event)
+        elif isinstance(event, list) and event and isinstance(event[0], dict): self.devices_found_signal.emit(event)
+        elif isinstance(event, list) and event and isinstance(event[0], SensorDataPoint): self.data_received_signal.emit(event)
+        elif isinstance(event, list) and not event: self.devices_found_signal.emit([])
+    @pyqtSlot(list)
+    def _update_plot_and_data(self, data_points: List[SensorDataPoint]):
+        self.full_measurement_data.extend(data_points)
+        for dp in data_points:
+            if self.measurement_start_time is None: self.measurement_start_time = dp.timestamp_ms
+            relative_time_ms = dp.timestamp_ms - self.measurement_start_time
+            self.plot_time_data.append(relative_time_ms); self.plot_cun_data.append(dp.pressure_pa_cun)
+            self.plot_guan_data.append(dp.pressure_pa_guan); self.plot_chi_data.append(dp.pressure_pa_chi)
+        self.cun_curve.setData(list(self.plot_time_data), list(self.plot_cun_data)); self.guan_curve.setData(list(self.plot_time_data), list(self.plot_guan_data)); self.chi_curve.setData(list(self.plot_time_data), list(self.plot_chi_data))
     def _handle_save_data(self):
-        if not self.time_data: QMessageBox.warning(self, "儲存錯誤", "沒有測量數據可供儲存。"); return
-        path, _ = QFileDialog.getSaveFileName(self, "儲存數據", "", "CSV Files (*.csv)")
+        if not self.full_measurement_data: return
+        path, _ = QFileDialog.getSaveFileName(self, "儲存原始數據", "", "CSV Files (*.csv)")
         if path:
             try:
                 with open(path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f); header = [field.name for field in fields(SensorDataPoint)]; writer.writerow(header)
-                    all_data = zip(list(self.time_data), list(self.cun_data), list(self.guan_data), list(self.chi_data))
-                    for row in all_data: writer.writerow(row)
-                self.log_message_signal.emit(f"數據已成功儲存到 {path}"); QMessageBox.information(self, "儲存成功", f"數據已成功儲存到\n{path}")
-            except IOError as e: self.log_message_signal.emit(f"[錯誤] 儲存檔案時出錯: {e}"); QMessageBox.critical(self, "儲存失敗", f"儲存檔案時出錯:\n{e}")
-    def closeEvent(self, event: Optional[QCloseEvent]):
-        reply = QMessageBox.question(self, '確認退出', "您確定要退出程式嗎？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.log_message_signal.emit("正在執行關機程序..."); 
-            if hasattr(self, 'rag_thread') and self.rag_thread.isRunning(): self.rag_thread.quit(); self.rag_thread.wait()
-            self.monitor.shutdown();
-            if event: event.accept()
+                    writer = csv.writer(f); writer.writerow(['timestamp_ms', 'pressure_pa_cun', 'pressure_pa_guan', 'pressure_pa_chi'])
+                    for dp in self.full_measurement_data: writer.writerow([dp.timestamp_ms, dp.pressure_pa_cun, dp.pressure_pa_guan, dp.pressure_pa_chi])
+                QMessageBox.information(self, "成功", f"數據已儲存至:\n{path}")
+            except IOError as e: QMessageBox.critical(self, "失敗", f"儲存檔案時出錯:\n{e}")
+    @pyqtSlot(str)
+    def _append_log_message(self, message):
+        self.log_text.append(message); self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+    @pyqtSlot(list)
+    def _update_device_list(self, devices):
+        self.device_list_widget.clear(); self.discovered_devices = devices
+        if not devices: self.device_list_widget.addItem("未發現任何設備")
         else:
-            if event: event.ignore()
+            for d in devices: self.device_list_widget.addItem(f"{d.get('name', 'N/A')} ({d.get('address', 'N/A')})")
+    def _handle_scan(self): self.log_message_signal.emit("正在掃描設備..."); self.monitor.scan_for_devices()
+    def _handle_connect(self):
+        if self.use_fake_monitor_checkbox.isChecked(): self.monitor.connect("00:11:22:33:44:55"); return
+        selected_item = self.device_list_widget.currentItem()
+        if not selected_item: return
+        address = selected_item.text().split('(')[1][:-1]; self.monitor.connect(address)
+    def _handle_disconnect(self): self.log_message_signal.emit("正在請求斷開連接..."); self.monitor.disconnect()
+    def _handle_stop(self): self.log_message_signal.emit("正在發送緊急停止指令..."); self.monitor.stop_measurement()
+    def _handle_reset(self): self.log_message_signal.emit("正在發送設備重置指令..."); self.monitor.reset()
+    def closeEvent(self, event: Optional[QCloseEvent]):
+        if QMessageBox.question(self, '確認', "您確定要退出程式嗎？") == QMessageBox.StandardButton.Yes:
+            if hasattr(self, 'rag_thread') and self.rag_thread.isRunning(): self.rag_thread.quit(); self.rag_thread.wait()
+            self.monitor.shutdown(); event.accept()
+        else: event.ignore()
 
 if __name__ == "__main__":
     pg.setConfigOptions(antialias=True)
-    app = QApplication(sys.argv); window = PulseMonitorGUI(); window.show(); sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    window = PulseMonitorGUI()
+    window.show()
+    sys.exit(app.exec())
