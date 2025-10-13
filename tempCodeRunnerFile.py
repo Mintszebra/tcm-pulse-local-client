@@ -1,0 +1,1 @@
+self._save_distance_report()

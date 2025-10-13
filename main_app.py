@@ -231,6 +231,23 @@ class PulseMonitorGUI(QMainWindow):
            (status == DeviceStatus.CONNECTED_IDLE) and self.full_measurement_data:
             self.log_message_signal.emit("操作結束，正在進行整合分析..."); self._run_integrated_analysis()
 
+    def _save_distance_report(self):
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S"); filename = f"pulse_distance_report_{timestamp}.txt"
+            report_content = f"脈搏波形相似度比對詳細報告\n時間: {timestamp}\n" + "=" * 40 + "\n\n"
+            display_order = [key for key in sorted(self.current_analysis_results.keys(), key=lambda x: ['寸', '關', '尺'].index(x[0]))]
+            for pos_key in display_order:
+                result = self.current_analysis_results[pos_key]; report_content += f"--- {pos_key} 比對結果 ---\n"
+                sim_data = result.get('sim_results')
+                if isinstance(sim_data, dict):
+                     report_content += f"  - {sim_data.get('最相似的標準樣本', ''):<5s} (距離: {sim_data.get('相似度(距離)', 0)})\n"
+                else: report_content += f"  - 比對失敗或無結果: {sim_data}\n"
+                report_content += "\n"
+            with open(filename, 'w', encoding='utf-8') as f: f.write(report_content)
+            self.log_message_signal.emit(f"詳細距離報告已自動儲存至: {filename}")
+        except Exception as e: self.log_message_signal.emit(f"錯誤：自動儲存距離報告失敗 - {e}")
+
+
     def _describe_features_from_vector(self, features: np.ndarray) -> str:
         if features is None or len(features) < 7: return "特徵數據不足"
         desc = (f"波形平均值 {features[0]:.1f}，標準差 {features[1]:.1f} (反映穩定性)，振幅範圍 {features[3]:.1f} - {features[2]:.1f}，"
