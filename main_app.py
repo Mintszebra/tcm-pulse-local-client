@@ -55,7 +55,7 @@ class PulseMonitorGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("智慧中醫脈診輔助系統 (整合版)")
+        self.setWindowTitle("智慧中醫脈診輔助系統")
         self.setGeometry(100, 100, 1200, 800)
         
         self.monitor: PulseDiagnosisInterface = RealPulseMonitor()
@@ -311,7 +311,7 @@ class PulseMonitorGUI(QMainWindow):
 
             html_output += f'<p align="center" style="font-size: 16px;"><b>--- {pos_key} 分析 ---</b></p>'
             
-            # --- 【核心修正開始】 ---
+            
             # 建立一個新的文字區塊來存放所有量化數據
             quantitative_block = f"<b>量化特徵:</b> {result['features_str']}\n<b>初步比對:</b> {preliminary_pulse_name}"
             
@@ -341,7 +341,7 @@ class PulseMonitorGUI(QMainWindow):
 
             # 使用 <pre> 標籤來保留換行格式並顯示
             html_output += f"<pre>{quantitative_block}</pre>"
-            # --- 【核心修正結束】 ---
+            
 
             rag_html = markdown.markdown(result['rag_response'], extensions=['fenced_code', 'tables'])
             html_output += f"<div>{rag_html}</div><hr>"
