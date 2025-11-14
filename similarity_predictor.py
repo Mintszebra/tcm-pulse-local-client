@@ -190,14 +190,20 @@ def find_most_similar(new_csv_path, reference_features, reference_labels, scaler
         ]
         closest_index = np.argmin(distances)
 
+        raw_label = reference_labels[closest_index]
+        clean_name = raw_label.split('_')[0]  # 例如 "數脈_aug_002" -> "數脈"
+        # --------------------------------
+
         result = {
             "檔案名稱": os.path.basename(new_csv_path),
-            "最相似的標準樣本": reference_labels[closest_index],
+            "最相似的標準樣本": clean_name,    # 使用乾淨的名稱回傳給 GUI
+            "原始樣本編號": raw_label,         # 保留原始編號供參考
             "相似度(距離)": f"{distances[closest_index]:.4f}",
         }
         return result
+        
 
     except Exception as e:
         tb_str = traceback.format_exc()
-        error_message = f"預測過程中發生錯誤: {e}\n\D詳細追蹤:\n{tb_str}"
+        error_message = f"預測過程中發生錯誤: {e}\n詳細追蹤:\n{tb_str}"
         return error_message
