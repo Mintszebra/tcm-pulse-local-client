@@ -170,7 +170,6 @@ class PulseMonitorGUI(QMainWindow):
         self.save_report_button.clicked.connect(self._handle_save_report); self.status_updated_signal.connect(self._update_status_display)
         self.devices_found_signal.connect(self._update_device_list); self.data_received_signal.connect(self._update_plot_and_data)
         self.log_message_signal.connect(self._append_log_message)
-        # --- 【修正 1】當設備列表的選擇項目改變時，也去觸發一次狀態更新，以確保「連接」按鈕狀態正確 ---
         self.device_list_widget.currentItemChanged.connect(lambda: self._update_status_display(self.current_status))
 
 

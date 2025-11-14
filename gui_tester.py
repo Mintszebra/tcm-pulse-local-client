@@ -1,4 +1,4 @@
-# 檔案: gui_app.py
+
 # 描述: 主要的前端 GUI 應用程式，新增了數據記錄與匯出功能。
 
 import tkinter as tk
@@ -50,7 +50,7 @@ class PulseMonitorApp:
         self.update_gui()
 
     def _create_widgets(self):
-        # ... (之前的 Connection 和 Measurement Settings 框架保持不變) ...
+        
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -90,9 +90,9 @@ class PulseMonitorApp:
         self.stop_button = ttk.Button(action_frame, text="Stop", command=self.device.stop_measurement, state=tk.DISABLED)
         self.stop_button.pack(fill=tk.BOTH, expand=True, pady=(5,0))
 
-        # ==========================================================
+        
         # --- *** 新增：數據記錄與匯出框架 *** ---
-        # ==========================================================
+       
         record_frame = ttk.LabelFrame(main_frame, text="Data Recording", padding=10)
         record_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 0))
 
@@ -121,9 +121,9 @@ class PulseMonitorApp:
         self.status_label = ttk.Label(self.root, text="Status: DISCONNECTED", padding=5, anchor=tk.W)
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # ==========================================================
+
     # --- *** 新增與修改的函數 *** ---
-    # ==========================================================
+    
 
     def start_custom_measurement(self):
         """讀取下拉選單的設定，並在啟動測量前清除舊數據"""
@@ -223,7 +223,7 @@ class PulseMonitorApp:
             messagebox.showerror("Error", f"Failed to export data: {e}")
 
     def update_button_states(self, status: DeviceStatus):
-        # ... (與之前相同，但新增對 export/clear 按鈕的控制) ...
+       
         self._current_status = status
         is_connected = status not in [DeviceStatus.DISCONNECTED, DeviceStatus.SCANNING, DeviceStatus.CONNECTING]
         is_measuring = status in [DeviceStatus.INFLATING, DeviceStatus.MEASURING]
@@ -241,7 +241,7 @@ class PulseMonitorApp:
         self.clear_button.config(state=tk.NORMAL if can_manage_data else tk.DISABLED)
 
 
-    # --- 其他函數保持不變 ---
+   
     def connect_device(self):
         selected = self.device_combobox.get()
         if not selected: return messagebox.showerror("Error", "Please select a device.")
