@@ -403,7 +403,7 @@ python test_push.py
 11. XGZP6857D Datasheet：<https://cfsensor.com/wp-content/uploads/2022/11/XGZP6857D-Pressure-Sensor-V2.9.pdf>
 12. Building a Bluetooth GATT Server on the Pi Pico W：<https://vanhunteradams.com/Pico/BLE/GATT_Server.html>
 
-完整參考文獻請見 `中醫師畢業專題報告.pdf`。
+
 
 ## 授權
 
