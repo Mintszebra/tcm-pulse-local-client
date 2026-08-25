@@ -32,9 +32,9 @@
 | 組成 | 職責 | 位置 |
 | :--- | :--- | :--- |
 | 前置資料處理（離線） | 文獻脈波圖轉 CSV、資料擴增，產出標準脈象指紋數據庫 | [Pulse2CSV](https://github.com/Mintszebra/Pulse2CSV) |
-| 自製診脈儀（韌體） | Raspberry Pi Pico 2 W + 氣動控制 + 壓力感測，模擬寸關尺三部與浮中沉三層按壓 | 另一 repo |
+| 自製診脈儀（韌體） | Raspberry Pi Pico 2 W + 氣動控制 + 壓力感測，模擬寸關尺三部與浮中沉三層按壓 | [blood-pulse-sampler](https://github.com/Doner357/blood-pulse-sampler) |
 | **本地端客戶端** | **PyQt6 桌面程式：BLE 連線、即時繪圖、兩階段混合式 AI 分析、報告上傳** | **本 repo** |
-| 雲端網站與資料庫 | Flask + MySQL，提供病歷建立、查詢與管理 | 另一 repo |
+| 雲端網站與資料庫 | Flask + MySQL，提供病歷建立、查詢與管理 | [tcm-pulse-Database](https://github.com/maplenight1235/tcm-pulse-Database) |
 
 > [!NOTE]
 > 本 repo 內的 `ref_features_*.npy` / `ref_labels_*.json` / `ref_scaler_*.pkl` 為 [Pulse2CSV](https://github.com/Mintszebra/Pulse2CSV) 的產出物，直接複製過來供執行期載入，**本 repo 不負責產生它們**。
@@ -152,7 +152,7 @@ cd tcm-pulse-local-client
 python -m venv .venv
 
 # Windows
-.venv\Scripts\activate
+.venv\Scriptsctivate
 # macOS / Linux
 source .venv/bin/activate
 
