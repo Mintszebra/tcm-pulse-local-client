@@ -152,7 +152,7 @@ cd tcm-pulse-local-client
 python -m venv .venv
 
 # Windows
-.venv\Scriptsctivate
+.venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
 
